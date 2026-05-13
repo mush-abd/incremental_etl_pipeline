@@ -1,0 +1,138 @@
+================================================================================
+PROJECT DEEP DIVE & INTERVIEW PREPARATION GUIDE
+Incremental Weather ETL Pipeline (Airflow, PySpark, Docker)
+================================================================================
+
+This document breaks down every aspect of your project, why specific architectural 
+decisions were made, the bugs we solved, and how to defend these choices in a 
+Data Engineering interview.
+
+--------------------------------------------------------------------------------
+PART 1: PROJECT OVERVIEW & ARCHITECTURE
+--------------------------------------------------------------------------------
+Goal: Build an automated, fault-tolerant, incremental ETL pipeline that fetches 
+raw API data, transforms it at scale, and loads it into a Data Lake architecture.
+
+1. THE INGESTION LAYER (Python / Requests)
+   - What it does: Calls the Open-Meteo API to download historical weather data.
+   - Why we used pure Python: Extracting data from REST APIs is I/O bound. Python's 
+     `requests` library is lightweight and perfect for grabbing JSON payloads 
+     and dumping them into a "Raw" landing zone.
+
+2. THE TRANSFORMATION LAYER (Apache Spark / PySpark)
+   - What it does: Reads the raw JSON, flattens parallel arrays into relational 
+     rows, filters by date, deduplicates, performs Data Quality (DQ) checks, and 
+     writes out to Parquet.
+   - Why we used PySpark: While Pandas could handle small API payloads, Spark is 
+     a distributed processing framework. By using Spark, you demonstrate that this 
+     pipeline can scale to process terabytes of data across a cluster. 
+
+3. THE ORCHESTRATION LAYER (Apache Airflow)
+   - What it does: Schedules the jobs to run daily and manages dependencies 
+     (Ingest MUST succeed before Transform starts).
+   - Why we used Airflow: Cron jobs are blind; they don't know if a previous task 
+     failed. Airflow provides dependency management, retries, and a visual UI 
+     for monitoring, which is the industry standard.
+
+4. THE INFRASTRUCTURE (Docker)
+   - What it does: Wraps the entire Airflow environment, along with Java and 
+     PySpark, into an isolated Linux container.
+   - Why we used Docker: Eliminates the "it works on my machine" problem. It 
+     guarantees that anyone who clones the repository can run the pipeline without 
+     having to manually configure Java paths, Python versions, or Hadoop utilities.
+
+--------------------------------------------------------------------------------
+PART 2: THE "INCREMENTAL WATERMARK" CONCEPT
+--------------------------------------------------------------------------------
+A "Watermark" is simply a tracker (in our case, `watermark.json`) that records 
+the last successfully processed date (e.g., "2024-01-07").
+
+Why is this a big deal?
+Instead of downloading and processing the entire history of weather data every 
+single day (Full Load), the pipeline reads the watermark and only fetches the 
+delta (the new 7 days of data). This is called Incremental Loading. It saves 
+massive amounts of compute cost, API limits, and time.
+
+--------------------------------------------------------------------------------
+PART 3: KEY BUGS WE SOLVED (Great stories for interviews)
+--------------------------------------------------------------------------------
+In an interview, they will ask: "Tell me about a challenging bug you faced." 
+Use these:
+
+1. The PySpark vs Python 3.13 Crash
+   - Issue: The Spark Python worker was crashing instantly with an EOFException 
+     and WinError 10038.
+   - Root Cause: You discovered that PySpark 3.5.x has hard incompatibilities 
+     with the newly released Python 3.13 due to internal changes in Python's 
+     socket handling.
+   - Solution: You rolled back the virtual environment to Python 3.11, which is 
+     fully supported by Spark, instantly stabilizing the workers.
+
+2. The Hadoop "winutils" Native IO Error
+   - Issue: When Spark tried to write the Parquet file, it threw a 
+     `java.lang.UnsatisfiedLinkError` regarding Hadoop NativeIO.
+   - Root Cause: Spark relies on Hadoop libraries for file operations. On Windows, 
+     Hadoop requires a hack (`winutils.exe` and `hadoop.dll`) to translate POSIX 
+     Linux commands to NTFS Windows commands.
+   - Solution: You completely bypassed the Windows file system headache by 
+     Dockerizing the pipeline. By moving the execution into a native Linux Docker 
+     container, Spark could use native file system commands, completely removing 
+     the need for winutils.
+
+3. The Bulk Ingestion File Discovery Bug
+   - Issue: The transform script was skipping batches because it was looking for 
+     a file named exactly `weather_2024-01-08.json`, but the data had been 
+     downloaded in a massive bulk file named `weather_2024-01-01.json`.
+   - Solution: You refactored the transform script to read ALL available JSON files 
+     in the raw directory, relying on Spark's `.filter()` function to slice out 
+     only the relevant 7 days for the current batch. This decoupled file naming 
+     from the transformation logic.
+
+--------------------------------------------------------------------------------
+PART 4: MOCK INTERVIEW Q&A
+--------------------------------------------------------------------------------
+
+Q1: Why did you choose Spark for this project instead of just using Pandas?
+A1: "I chose Spark because I wanted to design a pipeline that is infinitely 
+scalable. Pandas runs in-memory on a single machine, which is fine for small 
+API pulls. But if this pipeline were scaled to ingest gigabytes of weather IoT 
+sensor data globally, Pandas would crash with Out-Of-Memory errors. Spark's 
+distributed nature allows it to process that data across a cluster."
+
+Q2: How did you ensure Data Quality in your pipeline?
+A2: "In the transformation phase, I implemented explicit DQ checks. Because 
+weather data has natural bounds, I used PySpark filters to check for null values, 
+ensure temperatures were within realistic bounds (-90C to 60C), humidity was 
+between 0-100%, and wind speeds were not negative. I logged these violations 
+so we have observability into the API's data health."
+
+Q3: I see you saved the final data as Parquet. Why Parquet instead of CSV?
+A3: "Parquet is a columnar storage format, which is highly compressed and 
+optimized for analytical queries. If a Data Scientist only wants to query the 
+`temperature` column, Parquet allows the engine to only read that specific column 
+from disk, whereas a CSV would force the engine to scan the entire file row-by-row. 
+It drastically reduces I/O costs."
+
+Q4: Why did you partition the Parquet files by Year, Month, and Day?
+A4: "Partitioning physically organizes the data into separate folders on disk. 
+Since weather data is almost always queried by date ranges, partitioning by 
+year/month/day allows tools like Athena, Spark, or Presto to use 'Partition 
+Pruning'. If I query data for January 2024, the engine ignores all other folders, 
+making the query exponentially faster and cheaper."
+
+Q5: Explain your Docker architecture. Why not just use the standard Airflow image?
+A5: "The standard Apache Airflow image is lightweight and only contains Python. 
+Because I am using `BashOperator` to trigger my PySpark scripts directly on the 
+Airflow worker, the container physically needed a Java Virtual Machine (JVM) to 
+run Spark. I wrote a custom Dockerfile that extended the base Airflow image, 
+installed OpenJDK-17 via apt-get, and pip-installed PySpark. I also used volumes 
+in docker-compose to mount my local scripts, allowing for rapid development 
+without needing to rebuild the image."
+
+Q6: What happens if the API is down and the ingestion task fails?
+A6: "Because I am using Airflow to orchestrate the DAG, it handles failures 
+gracefully. The `ingest_task` would fail, and because the `transform_task` is 
+set downstream (`ingest_task >> transform_task`), the transform task would not 
+execute. This prevents dirty or missing data from being processed. Airflow would 
+flag the run as failed, and I could configure it to retry automatically or send 
+an email alert."

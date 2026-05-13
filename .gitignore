@@ -1,9 +1,32 @@
-venv/
+# Ignore everything by default
+*
 
+# Un-ignore all directories so git can traverse them
+!*/
+
+# --- Re-ignore directories we don't even want git to traverse ---
+venv/
+jdk17/
+.git/
 __pycache__/
 
+# --- Track necessary root files ---
+!.gitignore
+!Dockerfile
+!docker-compose.yaml
+!requirements.txt
+!README.md
+!Project_Explanation_and_Interview_Prep.txt
+
+# --- Track source code directories and their contents ---
+!scripts/**
+!dags/**
+!config/**
+
+# --- Track .gitignore files to preserve empty directories ---
+!data/.gitignore
+!watermark/.gitignore
+
+# --- Global ignores for artifacts ---
 *.pyc
-
-# Ignore the .env file containing environment variables
 .env
-
